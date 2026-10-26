@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1158,6 +1159,71 @@ class TestNativeCoreRealtime(unittest.TestCase):
                 self.assertFalse(hasattr(native_core_realtime, "delete_message"))
 
                 native_core_realtime.close_account(handle)
+
+
+class NativeQueryDiagnosticsTest(unittest.TestCase):
+    def test_terminal_database_error_is_recorded_once_without_retry(self):
+        error = native_core_realtime.NativeCoreError("SECRET", status=-15)
+        context = SimpleNamespace(db_storage_dir=Path("/synthetic"))
+        with (
+            patch.object(native_core_realtime, "managed_native_core_operation", return_value=nullcontext()),
+            patch.object(native_core_realtime, "get_native_core_client", return_value=object()),
+            patch.object(native_core_realtime, "_borrow_cached_read_database", side_effect=error) as borrowed,
+            patch.object(native_core_realtime, "record_native_core_diagnostic") as logged,
+        ):
+            with self.assertRaises(native_core_realtime.NativeCoreError) as raised:
+                native_core_realtime._query_once(context, Path("/synthetic/message.db"), "SECRET SQL")
+        self.assertIs(raised.exception, error)
+        self.assertEqual(borrowed.call_count, 1)
+        self.assertEqual(logged.call_count, 1)
+        self.assertEqual(logged.call_args.args[0], "native_query_generation_failed")
+        self.assertEqual(logged.call_args.kwargs["status"], -15)
+        self.assertNotIn("SECRET", str(logged.call_args))
+
+    def test_unavailable_keeps_failure_stage_and_existing_retry_bound(self):
+        for stage in ("open_database", "open_query", "fetch_query"):
+            with self.subTest(stage=stage):
+                error = native_core_realtime.NativeCoreUnavailableError("SECRET", status=-2)
+                context = SimpleNamespace(db_storage_dir=Path("/synthetic"))
+
+                class Query:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        return None
+
+                    def fetch(self, **_kwargs):
+                        raise error
+
+                class Database:
+                    def open_query(self, _sql):
+                        if stage == "open_query":
+                            raise error
+                        return Query()
+
+                def borrow(*_args):
+                    if stage == "open_database":
+                        raise error
+                    return nullcontext(Database())
+
+                with (
+                    patch.object(native_core_realtime, "managed_native_core_operation", return_value=nullcontext()),
+                    patch.object(native_core_realtime, "get_native_core_client", return_value=object()),
+                    patch.object(native_core_realtime, "_borrow_cached_read_database", side_effect=borrow) as borrowed,
+                    patch.object(native_core_realtime, "_close_cached_read_databases") as closed,
+                    patch.object(native_core_realtime, "note_native_core_query") as counted,
+                    patch.object(native_core_realtime, "record_native_core_diagnostic") as logged,
+                ):
+                    with self.assertRaises(native_core_realtime.NativeCoreUnavailableError) as raised:
+                        native_core_realtime._query_once(context, Path("/synthetic/message.db"), "SECRET SQL")
+                self.assertIs(raised.exception, error)
+                self.assertEqual(borrowed.call_count, 2)
+                self.assertEqual(counted.call_count, 2)
+                self.assertEqual(closed.call_count, 1)
+                self.assertEqual(logged.call_args.kwargs["stage"], stage)
+                self.assertEqual(logged.call_args.kwargs["status"], -2)
+                self.assertNotIn("SECRET", str(logged.call_args_list))
 
 
 if __name__ == "__main__":

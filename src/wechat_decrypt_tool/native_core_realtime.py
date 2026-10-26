@@ -15,7 +15,10 @@ from typing import Any, Callable, Iterator
 
 from . import native_core_raw_key_cache
 from .logging_config import get_logger
-from .native_core_broker import managed_native_core_operation, stop_native_core_broker
+from .native_core_broker import (
+    managed_native_core_operation, stop_native_core_broker,
+    note_native_core_query, record_native_core_diagnostic,
+)
 from .native_core_client import (
     NativeCoreClient,
     NativeCoreDatabase,
@@ -211,6 +214,7 @@ def _recycle_native_core_generation_after_limit(client: NativeCoreClient) -> Non
     with _limit_recycle_lock:
         if _last_limit_recycled_client is client:
             return
+        record_native_core_diagnostic("native_broker_recycle", reason="resource_limit")
         _close_cached_read_databases(client=client)
         stop_native_core_broker(_force=True)
         _last_limit_recycled_client = client
@@ -687,11 +691,16 @@ def _query_once(
     sql: str,
 ) -> list[dict[str, Any]]:
     limited_client: NativeCoreClient | None = None
+    stage = "begin"
+    started = time.monotonic()
 
     def read_all(database: NativeCoreDatabase) -> list[dict[str, Any]]:
+        nonlocal stage
         rows: list[dict[str, Any]] = []
+        stage = "open_query"
         with database.open_query(sql) as query:
             for _ in range(_MAX_QUERY_PAGES):
+                stage = "fetch_query"
                 page = query.fetch(max_rows=_PAGE_ROWS, max_bytes=_PAGE_BYTES)
                 records = page.records()
                 if len(rows) + len(records) > _MAX_QUERY_ROWS:
@@ -700,17 +709,25 @@ def _query_once(
                     )
                 rows.extend(dict(record) for record in records)
                 if not page.has_more:
+                    stage = "close_query"
                     return rows
         raise NativeCoreRealtimeError("Native-core query exceeded the application page limit.")
 
     def query_generation() -> list[dict[str, Any]]:
-        nonlocal limited_client
+        nonlocal limited_client, stage
+        stage = "acquire_broker"
         with managed_native_core_operation(database_root=context.db_storage_dir):
             for attempt in range(2):
+                stage = "get_client"
                 client = get_native_core_client()
+                note_native_core_query()
                 try:
+                    stage = "open_database"
                     with _borrow_cached_read_database(client, context, database_path) as database:
-                        return read_all(database)
+                        result = read_all(database)
+                    if attempt:
+                        record_native_core_diagnostic("native_query_recovered", attempt=attempt + 1)
+                    return result
                 except NativeCoreError as exc:
                     status = int(getattr(exc, "status", 0) or 0)
                     if status == int(NativeCoreStatus.LIMIT):
@@ -720,12 +737,23 @@ def _query_once(
                     )
                     if not stale_handle or attempt > 0:
                         raise
+                    # Terminal failures are recorded once by the outer handler.
+                    record_native_core_diagnostic(
+                        "native_query_retry", stage=stage, status=status,
+                        attempt=attempt + 1, error_type=type(exc).__name__,
+                        elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                    )
                     _close_cached_read_databases(client=client)
         raise NativeCoreRealtimeError("Native-core query retry loop ended unexpectedly.")
 
     try:
         return query_generation()
     except NativeCoreError as exc:
+        record_native_core_diagnostic(
+            "native_query_generation_failed", stage=stage,
+            status=int(getattr(exc, "status", 0) or 0), error_type=type(exc).__name__,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+        )
         if int(getattr(exc, "status", 0) or 0) != int(NativeCoreStatus.LIMIT):
             raise
         if limited_client is None:

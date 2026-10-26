@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import secrets
 import subprocess
@@ -8,6 +9,8 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 from .native_core_client import (
@@ -38,6 +41,95 @@ _owned_database_roots: tuple[Path, ...] = ()
 _owned_database_disabled = False
 _owned_environment: dict[str, tuple[str | None, str]] = {}
 _active_operations = 0
+_diagnostic_generation = 0
+_diagnostic_started: float | None = None
+_diagnostic_queries = 0
+_DIAGNOSTIC_REPEAT_SECONDS = 300.0
+_DIAGNOSTIC_LOG_MAX_BYTES = 5 * 1024 * 1024
+_DIAGNOSTIC_LOG_BACKUPS = 3
+_diagnostic_repeats: OrderedDict[tuple[object, ...], tuple[float, int]] = OrderedDict()
+
+
+def _rotate_diagnostic_log(path: Path, incoming_bytes: int) -> None:
+    """Rotate only Python diagnostics; the broker owns a separate open stderr file."""
+    if not path.exists() or path.stat().st_size + incoming_bytes <= _DIAGNOSTIC_LOG_MAX_BYTES:
+        return
+    for index in range(_DIAGNOSTIC_LOG_BACKUPS, 0, -1):
+        source = path if index == 1 else path.with_name(f"{path.name}.{index - 1}")
+        if source.exists():
+            source.replace(path.with_name(f"{path.name}.{index}"))
+
+
+def native_core_diagnostic_state() -> dict[str, object]:
+    """Inspect the owned process without starting it, querying it or exposing paths."""
+    with _lock:
+        process = _process
+        exit_code = process.poll() if process is not None else None
+        pid = getattr(process, "pid", None)
+        return {
+            "broker_pid": pid if type(pid) is int else None,
+            "broker_generation": _diagnostic_generation,
+            "broker_present": process is not None,
+            "broker_alive": process is not None and exit_code is None,
+            "broker_exit_code": exit_code if type(exit_code) is int else None,
+            "broker_signal": -exit_code if type(exit_code) is int and exit_code < 0 else None,
+            "broker_uptime_seconds": None if _diagnostic_started is None else round(time.monotonic() - _diagnostic_started, 3),
+            "broker_query_count": _diagnostic_queries,
+            "active_operations": _active_operations,
+        }
+
+
+def record_native_core_diagnostic(event: str, **fields: object) -> None:
+    """Bound file size and repeat volume; never serialize errors, SQL or keys."""
+    allowed = {"stage", "status", "attempt", "error_type", "forced", "reason", "elapsed_ms"}
+    try:
+        with _lock:
+            path = _broker_log_path()
+            if path is None:
+                return
+            path = path.with_name("native-core-diagnostics.log")
+            safe_fields = {key: value for key, value in fields.items()
+                           if key in allowed and type(value) in (str, int, float, bool, type(None))}
+            repeat_key = None
+            suppressed = 0
+            if event in {"native_query_retry", "native_query_error", "native_query_generation_failed"}:
+                now = time.monotonic()
+                repeat_key = (event, _diagnostic_generation, *(safe_fields.get(key) for key in
+                              ("stage", "status", "attempt", "error_type")))
+                previous = _diagnostic_repeats.get(repeat_key)
+                if previous is not None:
+                    last_written, suppressed = previous
+                    if now - last_written < _DIAGNOSTIC_REPEAT_SECONDS:
+                        _diagnostic_repeats[repeat_key] = (last_written, suppressed + 1)
+                        _diagnostic_repeats.move_to_end(repeat_key)
+                        return
+            value = {
+                "event": event,
+                "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                **native_core_diagnostic_state(),
+                **safe_fields,
+            }
+            if suppressed:
+                value["suppressed_count"] = suppressed
+            encoded = json.dumps(value, ensure_ascii=False) + "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_diagnostic_log(path, len(encoded.encode("utf-8")))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as output:
+                output.write(encoded)
+            if repeat_key is not None:
+                _diagnostic_repeats[repeat_key] = (now, 0)
+                _diagnostic_repeats.move_to_end(repeat_key)
+                while len(_diagnostic_repeats) > 128:
+                    _diagnostic_repeats.popitem(last=False)
+    except (OSError, ValueError):
+        pass
+
+
+def note_native_core_query() -> None:
+    with _lock:
+        global _diagnostic_queries
+        _diagnostic_queries += 1
 
 
 def _resolve_broker_trust_key(
@@ -368,6 +460,7 @@ def ensure_native_core_broker(
     export_only: bool = False,
 ) -> str:
     global _process, _owned_endpoint, _owned_database_roots, _owned_database_disabled
+    global _diagnostic_generation, _diagnostic_started, _diagnostic_queries
     with _lock:
         if export_only and database_root is not None:
             raise NativeCoreProtocolError(
@@ -420,6 +513,7 @@ def ensure_native_core_broker(
                     # bound to the new broker generation.
                     stop_native_core_broker()
             else:
+                record_native_core_diagnostic("native_broker_unexpected_exit")
                 _process = None
                 _owned_endpoint = ""
                 _owned_database_roots = ()
@@ -538,9 +632,13 @@ def ensure_native_core_broker(
         close_native_core_client()
         _install_owned_environment(endpoint, client_path)
         _process = process
+        _diagnostic_generation += 1
+        _diagnostic_started = time.monotonic()
+        _diagnostic_queries = 0
         _owned_endpoint = endpoint
         _owned_database_roots = launch_roots
         _owned_database_disabled = launch_database_disabled
+        record_native_core_diagnostic("native_broker_started")
         return endpoint
 
 
@@ -581,6 +679,8 @@ def stop_native_core_broker(*, _force: bool = False) -> None:
             raise _busy_error("stop while managed operations are active")
         process = _process
         endpoint = _owned_endpoint
+        if process is not None:
+            record_native_core_diagnostic("native_broker_stop_requested", forced=_force)
         _process = None
         _owned_endpoint = ""
         _owned_database_roots = ()
